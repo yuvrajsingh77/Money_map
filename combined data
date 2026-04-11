@@ -1,0 +1,29 @@
+import yfinance as yf
+import pandas as pd
+from datetime import date
+
+ticker_name = "RELIANCE.NS"
+
+# --- Step 1: historical data ---
+df_historical = yf.download(ticker_name, start="2020-01-01", end=date.today())
+df_historical.columns = [col[0] for col in df_historical.columns]
+print(f"Historical rows: {len(df_historical)}")
+
+# --- Step 2: live data ---
+df_live = yf.download(ticker_name, period="5d", interval="1h")
+df_live.columns = [col[0] for col in df_live.columns]
+df_live = df_live[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+# --- fix: remove timezone from live data index ---
+df_live.index = df_live.index.tz_localize(None)
+
+print(f"Live rows added: {len(df_live)}")
+
+# --- Step 3: combine ---
+df_combined = pd.concat([df_historical, df_live])
+df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
+df_combined.sort_index(inplace=True)
+
+print(f"Combined rows : {len(df_combined)}")
+print(f"\nLast 5 rows:")
+print(df_combined.tail(5))
