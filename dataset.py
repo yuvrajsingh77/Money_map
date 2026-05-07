@@ -28,5 +28,6 @@ for t in tickers:
     
 
 # --- Part 3: show sample historical data for one stock ---
+
 print("SAMPLE HISTORICAL DATA — RELIANCE.NS")
 print(historical_data["RELIANCE.NS"])

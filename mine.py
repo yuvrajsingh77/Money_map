@@ -4,61 +4,105 @@ import numpy as np
 from datetime import date
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import mplfinance as mpf
 
-ticker_name = "RELIANCE.NS"
+ticker_name = "TSLA"
 
 # =====================================================
 # STEP 1: GET DATA
 # =====================================================
 
-# historical daily data
-df_historical = yf.download(ticker_name, start="2024-01-01", end=date.today(), progress=False)
+df_historical = yf.download(ticker_name, start="2022-01-01", end=date.today(), progress=False)
 df_historical.columns = [col[0] for col in df_historical.columns]
 
-# live 1-minute data for today's real price
 df_live = yf.download(ticker_name, period="1d", interval="1m", progress=False)
-df_live.columns = [col[0] for col in df_live.columns]
-df_live = df_live[['Open', 'High', 'Low', 'Close', 'Volume']]
-df_live.index = df_live.index.tz_localize(None)
 
-# build today's candle manually from live data
-today_open   = float(df_live['Open'].iloc[0])
-today_high   = float(df_live['High'].max())
-today_low    = float(df_live['Low'].min())
-today_close  = float(df_live['Close'].iloc[-1])
-today_volume = int(df_live['Volume'].sum())
+if len(df_live) == 0:
+    print("Market is closed or no live data. Using last available price.")
+    df = df_historical.copy()
+else:
+    df_live.columns = [col[0] for col in df_live.columns]
+    df_live = df_live[['Open', 'High', 'Low', 'Close', 'Volume']]
+    df_live.index = df_live.index.tz_localize(None)
 
-today_row = pd.DataFrame({
-    'Open':   [today_open],
-    'High':   [today_high],
-    'Low':    [today_low],
-    'Close':  [today_close],
-    'Volume': [today_volume]
-}, index=[pd.Timestamp(date.today())])
+    today_open   = float(df_live['Open'].iloc[0])
+    today_high   = float(df_live['High'].max())
+    today_low    = float(df_live['Low'].min())
+    today_close  = float(df_live['Close'].iloc[-1])
+    today_volume = int(df_live['Volume'].sum())
 
-# combine historical + today
-df = pd.concat([df_historical, today_row])
-df = df[~df.index.duplicated(keep='last')]
+    today_row = pd.DataFrame({
+        'Open':   [today_open],
+        'High':   [today_high],
+        'Low':    [today_low],
+        'Close':  [today_close],
+        'Volume': [today_volume]
+    }, index=[pd.Timestamp(date.today())])
+
+    df = pd.concat([df_historical, today_row])
+    df = df[~df.index.duplicated(keep='last')]
+
 df.sort_index(inplace=True)
 
 print(f"Total rows : {len(df)}")
-print(f"Last price : ₹{today_close:.2f}")
+print(f"Last price : ₹{float(df['Close'].iloc[-1]):.2f}")
 
 # =====================================================
-# STEP 2: FEATURE ENGINEERING
+# STEP 2: FEATURE ENGINEERING (20 FEATURES)
 # =====================================================
 
-df['ma8']      = df['Close'].rolling(window=8).mean()
-df['ma15']     = df['Close'].rolling(window=15).mean()
-df['return']   = df['Close'].pct_change() * 100
+# --- price & lag (4) ---
+df['return'] = df['Close'].pct_change() * 100
+df['lag1']   = df['Close'].shift(1)
+df['lag2']   = df['Close'].shift(2)
+df['lag3']   = df['Close'].shift(3)
+
+# --- moving averages (3) ---
+df['ma8']   = df['Close'].rolling(window=8).mean()
+df['ma15']  = df['Close'].rolling(window=15).mean()
+df['ema21'] = df['Close'].ewm(span=21, adjust=False).mean()
+
+# --- volatility (3) ---
 df['volatile'] = df['return'].rolling(window=10).std()
-df['lag1']     = df['Close'].shift(1)
-df['lag2']     = df['Close'].shift(2)
-df['lag3']     = df['Close'].shift(3)
+bb_mid         = df['Close'].rolling(window=20).mean()
+bb_std         = df['Close'].rolling(window=20).std()
+df['bb_upper'] = bb_mid + (2 * bb_std)
+df['bb_lower'] = bb_mid - (2 * bb_std)
+
+# --- momentum (4) ---
+delta       = df['Close'].diff()
+gain        = delta.clip(lower=0).rolling(window=14).mean()
+loss        = (-delta.clip(upper=0)).rolling(window=14).mean()
+df['rsi14'] = 100 - (100 / (1 + gain / loss))
+df['roc10'] = df['Close'].pct_change(periods=10) * 100
+df['mom10'] = df['Close'] - df['Close'].shift(10)
+
+highest_high  = df['High'].rolling(window=14).max()
+lowest_low    = df['Low'].rolling(window=14).min()
+df['stoch_k'] = ((df['Close'] - lowest_low) / (highest_high - lowest_low)) * 100
+
+# --- trend (3) ---
+ema12             = df['Close'].ewm(span=12, adjust=False).mean()
+ema26             = df['Close'].ewm(span=26, adjust=False).mean()
+df['macd']        = ema12 - ema26
+df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+
+tr        = pd.concat([
+    df['High'] - df['Low'],
+    (df['High'] - df['Close'].shift()).abs(),
+    (df['Low']  - df['Close'].shift()).abs()
+], axis=1).max(axis=1)
+df['atr'] = tr.rolling(window=14).mean()
+
+# --- volume (2) ---
+df['vol_ma10']  = df['Volume'].rolling(window=10).mean()
+df['vol_ratio'] = df['Volume'] / df['vol_ma10']
+
+# --- price pattern (1) ---
+df['hl_range'] = df['High'] - df['Low']
 
 df.dropna(inplace=True)
 print(f"Rows after cleaning: {len(df)}")
@@ -67,11 +111,12 @@ print(f"Rows after cleaning: {len(df)}")
 # STEP 3: K-MEANS CLUSTERING
 # =====================================================
 
-cluster_features = ['ma8', 'ma15', 'return', 'volatile']
-scaler = StandardScaler()
-x_scaled = scaler.fit_transform(df[cluster_features])
+cluster_features = ['ma8', 'ma15', 'return', 'volatile',
+                    'rsi14', 'macd', 'atr', 'vol_ratio']
+scaler    = StandardScaler()
+x_scaled  = scaler.fit_transform(df[cluster_features])
 
-kmeans = KMeans(n_clusters=3, random_state=42)
+kmeans        = KMeans(n_clusters=3, random_state=42)
 df['cluster'] = kmeans.fit_predict(x_scaled)
 
 print("\nDays per cluster:")
@@ -84,8 +129,24 @@ print(df['cluster'].value_counts())
 df['target'] = df['Close'].shift(-1)
 df.dropna(inplace=True)
 
-feature_cols = ['Close', 'ma8', 'ma15', 'return',
-                'volatile', 'lag1', 'lag2', 'lag3', 'cluster']
+feature_cols = [
+    # price & lag
+    'Close', 'return', 'lag1', 'lag2', 'lag3',
+    # moving averages
+    'ma8', 'ma15', 'ema21',
+    # volatility
+    'volatile', 'bb_upper', 'bb_lower',
+    # momentum
+    'rsi14', 'roc10', 'mom10', 'stoch_k',
+    # trend
+    'macd', 'macd_signal', 'atr',
+    # volume
+    'vol_ratio',
+    # cluster
+    'cluster'
+]
+
+print(f"\nTotal features used: {len(feature_cols)}")
 
 X = df[feature_cols]
 y = df['target']
@@ -98,7 +159,7 @@ feature_scaler = MinMaxScaler()
 X_train_scaled = feature_scaler.fit_transform(X_train)
 X_test_scaled  = feature_scaler.transform(X_test)
 
-model = LinearRegression()
+model = Ridge(alpha=10.0)
 model.fit(X_train_scaled, y_train)
 
 predictions = model.predict(X_test_scaled)
@@ -111,10 +172,15 @@ rmse = np.sqrt(mean_squared_error(y_test, predictions))
 mae  = mean_absolute_error(y_test, predictions)
 r2   = r2_score(y_test, predictions)
 
+train_preds = model.predict(X_train_scaled)
+train_r2    = r2_score(y_train, train_preds)
+
 print("\n===== Model Performance =====")
-print(f"RMSE     : {rmse:.2f}")
-print(f"MAE      : {mae:.2f}")
-print(f"R² Score : {r2:.4f}")
+print(f"RMSE       : {rmse:.2f}")
+print(f"MAE        : {mae:.2f}")
+print(f"Train R²   : {train_r2:.4f}")
+print(f"Test  R²   : {r2:.4f}")
+print(f"Difference : {train_r2 - r2:.4f}  {'(overfitting)' if train_r2 - r2 > 0.05 else '(healthy)'}")
 
 last_row   = feature_scaler.transform(X.iloc[[-1]])
 next_price = model.predict(last_row)[0]
